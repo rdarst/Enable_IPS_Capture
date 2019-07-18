@@ -1,0 +1,90 @@
+#!/bin/bash
+
+CMA="CMA1"
+PROFILE="Basic"
+JQ=${CPDIR}/jq/jq
+
+#
+# Setup Function to call the commands and parse all the results of the command
+# Note this only works for objects and not access rules/layers  !!!!
+#
+
+mgmt_cli_query () {
+
+ JQ=${CPDIR}/jq/jq
+ FINISHED=false
+ ITERATIONS=0
+ LIMIT="0"
+ OFFSET="0"
+ OBJECTS=""
+
+ while [ $FINISHED == false ]
+        do
+
+          OFFSET=$[$LIMIT*$ITERATIONS]
+          OUTPUT=$(mgmt_cli "$@" offset $OFFSET)
+
+          if [ $? -ne 0 ]; then
+                        echo $OUTPUT
+                        exit 1
+          fi
+
+          TOTAL=$(echo ${OUTPUT} | ${JQ} .total )
+          FROM=$(echo ${OUTPUT} | ${JQ} .from )
+          RECEIVED_OBJ=$(echo ${OUTPUT} | ${JQ} .to )
+          OBJECTS+=$(echo ${OUTPUT} | ${JQ} .protections[])
+          OBJECTS+=$'\n'
+
+          if (($TOTAL == $RECEIVED_OBJ)); then
+                FINISHED=true
+          fi
+
+          if [ "$LIMIT" -eq "0" ]; then
+                LIMIT=$RECEIVED_OBJ
+          fi
+          let ITERATIONS=$ITERATIONS+1
+ done
+
+ echo "${OBJECTS}" | ${JQ} -s .
+
+}
+
+#####################################################################
+###  Start Gathering data
+#####################################################################
+echo "Starting"
+date
+#Login to R80.X
+echo "Logging into CMA ==> $CMA"
+SID=$(mgmt_cli -r true login domain "$CMA" --format json |jq -r '.sid')
+RESULT=$(mgmt_cli_query show-threat-protections limit 250 --format json --session-id $SID)
+PROTECTIONS=$(echo "${RESULT}" | ${JQ} -r '.[].uid')
+COUNT=$(echo "${RESULT}" | ${JQ} -r '.[].uid' |wc -l)
+echo "Protection Count is $COUNT"
+
+#####################################################################
+###  Set Packet Capture to true
+#####################################################################
+
+CHANGECOUNT=0
+while read -r line; do
+    echo "Setting protection with UID $line"
+    SETCAPTURE=$(mgmt_cli set-threat-protection uid "$line" overrides.1.profile "$PROFILE" overrides.1.capture-packets true --format json --session-id $SID)
+# Publish changes if we have more than 250 updates
+    CHANGECOUNT=$((CHANGECOUNT+1))
+    if [ $CHANGECOUNT -gt 250 ]
+    then
+      mgmt_cli publish --session-id $SID --format json | ${JQ} -r '.message'
+      CHANGECOUNT=0
+    fi
+done <<< "${PROTECTIONS}"
+
+#####################################################################
+###  Publish and logout
+#####################################################################
+mgmt_cli publish --session-id $SID --format json | ${JQ} -r '.message'
+echo "Script Finished"
+date
+mgmt_cli logout --session-id $SID --format json | ${JQ} -r '.message'
+
+
