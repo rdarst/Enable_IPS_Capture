@@ -1,12 +1,18 @@
 #!/bin/bash
 
-CMA="CMA1"
-PROFILE="Basic"
+if [ "$1" == "" ] || [ "$2" == "" ]; then
+    echo "Error - use the format set_capture DOMAIN IPS_PROFILE"
+    echo "Use the domain SMARTCENTER for a SmartCenter install"
+    exit 1 
+fi
+
+CMA=$1
+PROFILE=$2
 JQ=${CPDIR}/jq/jq
 
 #
 # Setup Function to call the commands and parse all the results of the command
-# Note this only works for objects and not access rules/layers  !!!!
+# Note this only works for protections and not access rules/layers  !!!!
 #
 
 mgmt_cli_query () {
@@ -19,30 +25,30 @@ mgmt_cli_query () {
  OBJECTS=""
 
  while [ $FINISHED == false ]
-        do
+	do
 
-          OFFSET=$[$LIMIT*$ITERATIONS]
-          OUTPUT=$(mgmt_cli "$@" offset $OFFSET)
+	  OFFSET=$[$LIMIT*$ITERATIONS]
+	  OUTPUT=$(mgmt_cli "$@" offset $OFFSET)
 
-          if [ $? -ne 0 ]; then
-                        echo $OUTPUT
-                        exit 1
-          fi
+	  if [ $? -ne 0 ]; then
+			echo $OUTPUT
+			exit 1
+	  fi
 
-          TOTAL=$(echo ${OUTPUT} | ${JQ} .total )
-          FROM=$(echo ${OUTPUT} | ${JQ} .from )
-          RECEIVED_OBJ=$(echo ${OUTPUT} | ${JQ} .to )
-          OBJECTS+=$(echo ${OUTPUT} | ${JQ} .protections[])
-          OBJECTS+=$'\n'
+	  TOTAL=$(echo ${OUTPUT} | ${JQ} .total )
+	  FROM=$(echo ${OUTPUT} | ${JQ} .from )
+	  RECEIVED_OBJ=$(echo ${OUTPUT} | ${JQ} .to )
+	  OBJECTS+=$(echo ${OUTPUT} | ${JQ} .protections[])
+	  OBJECTS+=$'\n'
 
-          if (($TOTAL == $RECEIVED_OBJ)); then
-                FINISHED=true
-          fi
+	  if (($TOTAL == $RECEIVED_OBJ)); then
+		FINISHED=true
+	  fi
 
-          if [ "$LIMIT" -eq "0" ]; then
-                LIMIT=$RECEIVED_OBJ
-          fi
-          let ITERATIONS=$ITERATIONS+1
+	  if [ "$LIMIT" -eq "0" ]; then
+		LIMIT=$RECEIVED_OBJ
+	  fi
+	  let ITERATIONS=$ITERATIONS+1
  done
 
  echo "${OBJECTS}" | ${JQ} -s .
@@ -52,39 +58,68 @@ mgmt_cli_query () {
 #####################################################################
 ###  Start Gathering data
 #####################################################################
-echo "Starting"
-date
-#Login to R80.X
-echo "Logging into CMA ==> $CMA"
-SID=$(mgmt_cli -r true login domain "$CMA" --format json |jq -r '.sid')
-RESULT=$(mgmt_cli_query show-threat-protections limit 250 --format json --session-id $SID)
-PROTECTIONS=$(echo "${RESULT}" | ${JQ} -r '.[].uid')
-COUNT=$(echo "${RESULT}" | ${JQ} -r '.[].uid' |wc -l)
-echo "Protection Count is $COUNT"
+DATE=$(date)
+echo "Starting Script at ${DATE}"
+
+#Login to R80.X either MDS to Smartcenter
+if [ "${CMA}" == "SMARTCENTER" ]; then
+  echo "Logging into SmartCenter"
+  SID=$(mgmt_cli -r true login --format json |jq -r '.sid')
+else
+  echo "Logging into CMA ==> $CMA"
+  SID=$(mgmt_cli -r true login domain "$CMA" --format json |jq -r '.sid')
+fi
+
+TOTAL=$(mgmt_cli -r true show-threat-protections details-level uid --session-id $SID -f json |jq '.total')
+echo "Gathering protection data from $TOTAL protections"
+
+RESULT=$(mgmt_cli_query show-threat-protections details-level full limit 250 --format json --session-id $SID)
+PROTECTIONS=$(echo "$RESULT" | ${JQ} -r --arg PROFILE "$PROFILE" '.[] |select(."protection-type" != "Core") | .uid as $uid | .name as $name |.profiles[] |select(.name==$PROFILE and (.final.action != "Inactive" and .final."capture-packets" != true)) | [$uid, $name, .final.action] |@csv')
+
+# Check to see we have something to change
+CHANGECOUNT=$(echo $PROTECTIONS | grep -v -e '^$' | wc -l)
+echo "Change Count is ${CHANGECOUNT}"
+if [ "${CHANGECOUNT}" == 0 ];then 
+  echo "No changes to make.  Script Stopping!!!"
+  echo "Logging out of CMA/SmartCenter"
+  mgmt_cli logout --session-id $SID --format json | ${JQ} -r '.message'
+  exit 1
+fi
 
 #####################################################################
 ###  Set Packet Capture to true
 #####################################################################
 
-CHANGECOUNT=0
+CHANGECOUNT=1
 while read -r line; do
-    echo "Setting protection with UID $line"
-    SETCAPTURE=$(mgmt_cli set-threat-protection uid "$line" overrides.1.profile "$PROFILE" overrides.1.capture-packets true --format json --session-id $SID)
-# Publish changes if we have more than 250 updates
-    CHANGECOUNT=$((CHANGECOUNT+1))
+     PROTECTIONUID=$(echo $line |cut -d "," -f 1)
+     PROTECTIONNAME=$(echo $line |cut -d "," -f 2)
+     ACTION=$(echo $line |cut -d "," -f 3 | tr -d '"')
+     if [ $ACTION == "Prevent" ] || [ $ACTION == "Detect" ]
+     then
+        echo "Setting protection ${PROTECTIONNAME} with UID ${PROTECTIONUID} and Action ${ACTION}" 
+        SETPROFILE="${SETPROFILE} overrides.add.${CHANGECOUNT}.protection ${PROTECTIONUID} overrides.add.${CHANGECOUNT}.capture-packets true overrides.add.${CHANGECOUNT}.action $ACTION " 
+        CHANGECOUNT=$((CHANGECOUNT+1))
+     fi 
+
+# Publish changes if we have more than 100 updates
+#    CHANGECOUNT=$((CHANGECOUNT+1))
     if [ $CHANGECOUNT -gt 250 ]
     then
+      mgmt_cli set-threat-profile name ${PROFILE} ${SETPROFILE}  --session-id $SID --format json
       mgmt_cli publish --session-id $SID --format json | ${JQ} -r '.message'
-      CHANGECOUNT=0
+      CHANGECOUNT=1
+      SETPROFILE=""
     fi
 done <<< "${PROTECTIONS}"
 
 #####################################################################
-###  Publish and logout
+###  Publish and logout 
 #####################################################################
+
+mgmt_cli set-threat-profile name ${PROFILE} ${SETPROFILE}  --session-id $SID --format json
 mgmt_cli publish --session-id $SID --format json | ${JQ} -r '.message'
-echo "Script Finished"
-date
+DATE=$(date)
+echo "Script Finished ${DATE}"
+echo "Logging out of CMA/SmartCenter"
 mgmt_cli logout --session-id $SID --format json | ${JQ} -r '.message'
-
-
