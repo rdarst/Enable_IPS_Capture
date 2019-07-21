@@ -1,4 +1,4 @@
-# Enable_IPS_Capture
+# Enable_IPS_Capture in Check Point R80.X
 Script to enable Packet Capture on all IPS protections in a provided profile
 
 This script is run on the SmartCenter or MDS server where the SmartCenter/Domain exists
@@ -14,3 +14,5 @@ This script is run on the SmartCenter or MDS server where the SmartCenter/Domain
 ```
 ./set_capture SMARTCENTER My_IPS_Profile
 ```
+
+Tested on R80.30GA SmartCenter and MDS
